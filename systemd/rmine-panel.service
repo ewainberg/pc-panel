@@ -1,0 +1,17 @@
+[Unit]
+Description=Saladasz Soft front panel OLED and gauge controller
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_PI_USER
+WorkingDirectory=/home/REPLACE_WITH_PI_USER/saladasz-soft-front-panel/pi
+ExecStartPre=/usr/bin/test -c /dev/ttyUSB0
+ExecStart=/home/REPLACE_WITH_PI_USER/oled-env/bin/python /home/REPLACE_WITH_PI_USER/saladasz-soft-front-panel/pi/rmine_panel.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

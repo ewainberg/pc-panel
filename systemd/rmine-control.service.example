@@ -1,0 +1,14 @@
+[Unit]
+Description=Saladasz Soft panel control GUI
+After=network.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_HOST_USER
+WorkingDirectory=/home/REPLACE_WITH_HOST_USER/saladasz-soft-front-panel/host
+ExecStart=/usr/bin/python3 /home/REPLACE_WITH_HOST_USER/saladasz-soft-front-panel/host/rmine_control.py REPLACE_WITH_PI_IP
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
