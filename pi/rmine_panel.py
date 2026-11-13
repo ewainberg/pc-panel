@@ -9,6 +9,7 @@ import signal
 import socket
 import struct
 import subprocess
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -330,6 +331,34 @@ class TelemetryReceiver:
             self.sock.close()
         except Exception:
             pass
+
+
+class WifiMonitor:
+    def __init__(self):
+        self.connected = False
+        threading.Thread(target=self.monitor, daemon=True).start()
+
+    def monitor(self):
+        while True:
+            try:
+                state = subprocess.check_output(
+                    ["nmcli", "-g", "GENERAL.STATE", "device", "show", "wlan0"],
+                    text=True, timeout=2, stderr=subprocess.DEVNULL,
+                ).strip()
+                self.connected = state.split(maxsplit=1)[0] == "100"
+            except (OSError, subprocess.SubprocessError, IndexError):
+                self.connected = False
+            time.sleep(5)
+
+
+def draw_pc_no_data(image, wifi_connected, metrics):
+    if not wifi_connected or metrics.get("source") != "LOCAL":
+        return
+    draw = make_draw(image)
+    label = "PC NO DATA"
+    width = draw.textbbox((0, 0), label, font=F_TINY)[2]
+    draw.rectangle((254 - width - 4, 0, 255, 10), fill=0)
+    draw.text((254 - width - 2, 1), label, font=F_TINY, fill=230)
 
 
 class ControlReceiver:
@@ -1311,6 +1340,7 @@ def main():
         notice_started = 0.0
         notice = None
         wifi_recovery_until = 0.0
+        wifi = WifiMonitor()
 
         while running:
             loop_start = time.monotonic()
@@ -1389,6 +1419,7 @@ def main():
             if notice and loop_start - notice_started < notification_duration(notice):
                 if name != "audio" or notice.get("kind") != "music":
                     draw_notification(image, notice, loop_start - notice_started)
+            draw_pc_no_data(image, wifi.connected, m)
             gauges.send(gl, gr)
             oled.send(image)
             last_image = image
