@@ -3,3 +3,5 @@ __pycache__/
 *.log
 build/
 .venv/
+.venv-windows/
+host/windows/last*-test.json

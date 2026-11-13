@@ -2,6 +2,8 @@
 
 Raspberry Pi OLED dashboard, Arduino Nano analog gauges, host telemetry sender, and a browser scene controller for a retro PC front panel.
 
+Windows hosts: see [README-Windows.md](README-Windows.md) for the Windows sender, per-user startup, configuration, and removal.
+
 ## Components
 
 - `pi/rmine_panel.py`: SSD1322 OLED scene system. Receives host telemetry on UDP `7355` and scene commands on UDP `7356`.
