@@ -1,57 +1,90 @@
 #!/usr/bin/env python3
 import argparse
+import curses
 import json
 import socket
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
 
 
 SCENES = [
-    ("status", "Core Status"), ("history", "Load History"), ("network", "Network"),
-    ("clock", "Clock"), ("starfield", "Deep Field"), ("radar", "Radar"),
-    ("wireframe", "Vector Object"), ("scope", "Oscilloscope"),
-    ("life", "Cellular Field"), ("hex", "Memory Window"),
+    ("status", "Core Status"),
+    ("gpu", "GPU Monitor"),
+    ("history", "Load History"),
+    ("network", "Network"),
+    ("clock", "Clock"),
+    ("starfield", "Deep Field"),
+    ("radar", "Radar"),
+    ("wireframe", "Vector Object"),
+    ("scope", "Oscilloscope"),
+    ("audio", "Sound Reactive"),
+    ("life", "Cellular Field"),
+    ("hex", "Memory Window"),
     ("diagnostic", "Diagnostic Scan"),
 ]
 
-PAGE = """<!doctype html><meta charset=utf-8><title>Saladasz Soft Panel Control</title>
-<style>body{{background:#10140f;color:#c9f8b4;font:16px monospace;margin:0}}main{{max-width:660px;margin:7vh auto;padding:26px;border:1px solid #406b39}}form{{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}}button{{background:#172017;border:1px solid #4d9b45;color:#d7ffd1;cursor:pointer;font:inherit;padding:13px}}.auto{{grid-column:1/-1;background:#315a2b}}</style>
-<main><h1>SALADASZ SOFT // PANEL CONTROL</h1><p>Select a scene to hold it on the OLED. Auto Cycle resumes normal rotation.</p><form method=post><button class=auto name=scene value=auto>AUTO CYCLE</button>{buttons}</form></main>"""
+
+def send_command(target, command):
+    message = json.dumps(command).encode("utf-8")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(message, (target, 7356))
 
 
-class ControlHandler(BaseHTTPRequestHandler):
-    target = None
+def run(screen, target):
+    items = [("auto", "AUTO CYCLE")] + SCENES
+    selected = 0
+    lamp = 25
+    status = "Arrows/J/K select. Enter sends. L cycles lamp brightness. Q quits."
+    curses.curs_set(0)
+    screen.keypad(True)
 
-    def do_GET(self):
-        buttons = "".join(f'<button name=scene value={key}>{label}</button>' for key, label in SCENES)
-        page = PAGE.format(buttons=buttons).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(page)))
-        self.end_headers()
-        self.wfile.write(page)
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        screen.attron(curses.A_BOLD)
+        screen.addnstr(1, 2, "SALADASZ SOFT // PANEL CONTROL", width - 4)
+        screen.attroff(curses.A_BOLD)
+        screen.addnstr(2, 2, f"TARGET {target}  |  LAMP {lamp:03d}%", width - 4)
+        screen.hline(3, 2, curses.ACS_HLINE, max(0, width - 4))
 
-    def do_POST(self):
-        size = int(self.headers.get("Content-Length", 0))
-        scene = parse_qs(self.rfile.read(size).decode()).get("scene", [""])[0]
-        if scene == "auto" or scene in dict(SCENES):
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.sendto(json.dumps({"scene": scene}).encode(), (self.target, 7356))
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.end_headers()
+        for index, (_, label) in enumerate(items):
+            y = index + 5
+            if y >= height - 2:
+                break
+            marker = ">" if index == selected else " "
+            mode = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            screen.attron(mode)
+            screen.addnstr(y, 3, f"{marker} {index:02d}  {label}", width - 6)
+            screen.attroff(mode)
 
-    def log_message(self, *_):
-        pass
+        screen.hline(height - 2, 2, curses.ACS_HLINE, max(0, width - 4))
+        screen.addnstr(height - 1, 2, status, width - 4)
+        screen.refresh()
+
+        key = screen.getch()
+        if key in (ord("q"), ord("Q"), 27):
+            return
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            selected = (selected - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            selected = (selected + 1) % len(items)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            scene, label = items[selected]
+            send_command(target, {"scene": scene})
+            status = f"SENT: {label}"
+        elif key in (ord("l"), ord("L")):
+            lamp = (lamp + 25) % 125
+            send_command(target, {"lamp": lamp})
+            status = f"SENT: LAMP {lamp}%"
+        elif ord("0") <= key <= ord("9"):
+            index = key - ord("0")
+            if index < len(items):
+                selected = index
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("target", help="Pi hostname or IP")
-    parser.add_argument("--port", type=int, default=8080)
+    parser = argparse.ArgumentParser(description="Panel TUI")
+    parser.add_argument("target", nargs="?", default="10.6.25.9", help="Pi hostname or IP")
     args = parser.parse_args()
-    ControlHandler.target = args.target
-    ThreadingHTTPServer(("127.0.0.1", args.port), ControlHandler).serve_forever()
+    curses.wrapper(run, args.target)
 
 
 if __name__ == "__main__":

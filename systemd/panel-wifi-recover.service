@@ -1,0 +1,9 @@
+[Unit]
+Description=Panel Wi-Fi recovery
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nmcli radio wifi off
+ExecStartPost=/usr/bin/sleep 2
+ExecStartPost=/usr/bin/nmcli radio wifi on
+ExecStartPost=/usr/bin/nmcli connection up id "Velocity Wi-Fi" ifname wlan0

@@ -14,11 +14,14 @@ const uint16_t GAUGE_B_MAX = 4095;
 const uint16_t STEP = 40;
 const unsigned long UPDATE_MS = 10;
 const unsigned long SERIAL_TIMEOUT_MS = 5000;
+const unsigned long SWITCH_DEBOUNCE_MS = 35;
+const unsigned long WIFI_RECOVERY_WINDOW_MS = 2500;
 
 uint16_t currentA = 0;
 uint16_t currentB = 0;
 uint16_t telemetryA = 0;
 uint16_t telemetryB = 0;
+uint8_t lampBrightness = LAMP_BRIGHTNESS;
 unsigned long lastUpdate = 0;
 unsigned long lastSerial = 0;
 char rxBuffer[16];
@@ -35,6 +38,11 @@ enum BootState {
 
 BootState bootState = BOOT_OFF;
 unsigned long bootStateStarted = 0;
+bool switchOn = false;
+bool lastRawSwitch = false;
+unsigned long switchChangedAt = 0;
+uint8_t switchOnCount = 0;
+unsigned long firstSwitchOnAt = 0;
 
 uint16_t percentToDac(int percent, uint16_t minimum, uint16_t maximum) {
   percent = constrain(percent, 0, 100);
@@ -77,6 +85,10 @@ void parseLine(char *line) {
   if (!comma) return;
 
   *comma = '\0';
+  if (strcmp(line, "LAMP") == 0) {
+    lampBrightness = (uint8_t)constrain(atoi(comma + 1) * 255 / 100, 0, 255);
+    return;
+  }
   telemetryA = percentToDac(atoi(line), GAUGE_A_MIN, GAUGE_A_MAX);
   telemetryB = percentToDac(atoi(comma + 1), GAUGE_B_MIN, GAUGE_B_MAX);
   lastSerial = millis();
@@ -108,11 +120,36 @@ void setup() {
   configureChannelForVddReference(1);
   writeGauges(0, 0);
   lastSerial = millis();
+  lastRawSwitch = digitalRead(SWITCH_SENSE_PIN) == HIGH;
+  switchOn = lastRawSwitch;
 }
 
 void loop() {
   readSerial();
   unsigned long now = millis();
+
+  bool rawSwitch = digitalRead(SWITCH_SENSE_PIN) == HIGH;
+  if (rawSwitch != lastRawSwitch) {
+    lastRawSwitch = rawSwitch;
+    switchChangedAt = now;
+  }
+  if (now - switchChangedAt >= SWITCH_DEBOUNCE_MS && rawSwitch != switchOn) {
+    switchOn = rawSwitch;
+    if (switchOn) {
+      if (now - firstSwitchOnAt > WIFI_RECOVERY_WINDOW_MS) {
+        switchOnCount = 0;
+        firstSwitchOnAt = now;
+      }
+      if (++switchOnCount >= 2) {
+        Serial.println("WIFI");
+        switchOnCount = 0;
+        firstSwitchOnAt = 0;
+      }
+    }
+  }
+  if (switchOnCount && now - firstSwitchOnAt > WIFI_RECOVERY_WINDOW_MS) {
+    switchOnCount = 0;
+  }
 
   if (now - lastSerial > SERIAL_TIMEOUT_MS) {
     telemetryA = 0;
@@ -122,7 +159,7 @@ void loop() {
   if (now - lastUpdate < UPDATE_MS) return;
   lastUpdate = now;
 
-  if (digitalRead(SWITCH_SENSE_PIN) != HIGH) {
+  if (!switchOn) {
     bootState = BOOT_OFF;
     analogWrite(LAMP_PWM_PIN, 0);
     currentA = 0;
@@ -134,8 +171,10 @@ void loop() {
   if (bootState == BOOT_OFF) {
     bootState = BOOT_LAMP_ON;
     bootStateStarted = now;
-    analogWrite(LAMP_PWM_PIN, LAMP_BRIGHTNESS);
+    analogWrite(LAMP_PWM_PIN, lampBrightness);
   }
+
+  analogWrite(LAMP_PWM_PIN, lampBrightness);
 
   uint16_t targetA = telemetryA;
   uint16_t targetB = telemetryB;

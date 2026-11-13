@@ -7,6 +7,7 @@ import os
 import random
 import signal
 import socket
+import struct
 import subprocess
 import time
 from collections import deque
@@ -22,7 +23,7 @@ except ImportError:
 
 WIDTH = 256
 HEIGHT = 64
-FPS = 10.0
+FPS = 30.0
 FRAME_INTERVAL = 1.0 / FPS
 TRANSITION_FPS = 18.0
 TRANSITION_FRAMES = 8
@@ -30,6 +31,11 @@ TELEMETRY_PORT = 7355
 TELEMETRY_STALE = 2.5
 CONTROL_PORT = 7356
 OLED_LIB = "/home/maxpower/liboled.so"
+FROZEN_AUDIO_BANDS = [0.0] * 32
+AUDIO_WAS_PAUSED = False
+AUDIO_RELEASED_AT = None
+CHRIS_GLB = "/home/maxpower/rmine_panel_v2/pi/chris.glb"
+NISSAN_WIREFRAME = "/home/maxpower/rmine_panel_v2/pi/300zx_wireframe.json"
 
 
 def clamp(v, lo=0.0, hi=100.0):
@@ -76,6 +82,10 @@ BOLD_PATH = font_path(
         "/usr/share/fonts/truetype/freefont/FreeMonoBold.ttf",
     ],
 )
+CJK_PATH = font_path(
+    "Noto Sans CJK JP",
+    ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"],
+)
 
 if not REGULAR_PATH or not BOLD_PATH:
     raise RuntimeError(
@@ -93,6 +103,17 @@ F_MED = ImageFont.truetype(REGULAR_PATH, 10)
 F_MED_B = ImageFont.truetype(BOLD_PATH, 10)
 F_BIG = ImageFont.truetype(BOLD_PATH, 15)
 F_HUGE = ImageFont.truetype(BOLD_PATH, 28)
+CJK_FONTS = {
+    8: ImageFont.truetype(CJK_PATH, 8),
+    9: ImageFont.truetype(CJK_PATH, 9),
+    10: ImageFont.truetype(CJK_PATH, 10),
+} if CJK_PATH else {}
+
+
+def display_font(text, font):
+    if CJK_FONTS and any(ord(char) > 127 for char in text):
+        return CJK_FONTS.get(font.size, CJK_FONTS[9])
+    return font
 
 
 def canvas():
@@ -149,6 +170,8 @@ class GaugeLink:
         self.ser = None
         self.port = None
         self.last = None
+        self.rx_buffer = bytearray()
+        self.lamp = 25
         if serial is None:
             return
 
@@ -189,6 +212,28 @@ class GaugeLink:
                 self.ser.close()
             except Exception:
                 pass
+            self.ser = None
+
+    def poll_command(self):
+        if not self.ser:
+            return None
+        try:
+            self.rx_buffer.extend(self.ser.read(self.ser.in_waiting or 1))
+            if b"\n" not in self.rx_buffer:
+                return None
+            line, _, remainder = self.rx_buffer.partition(b"\n")
+            self.rx_buffer = bytearray(remainder)
+            return line.decode("ascii", "ignore").strip()
+        except Exception:
+            return None
+
+    def set_lamp(self, percent):
+        self.lamp = int(clamp(percent, 0, 100))
+        if not self.ser:
+            return
+        try:
+            self.ser.write(f"LAMP,{self.lamp}\n".encode("ascii"))
+        except Exception:
             self.ser = None
 
     def close(self):
@@ -296,6 +341,7 @@ class ControlReceiver:
 
     def poll(self):
         scene = None
+        lamp = None
         while True:
             try:
                 raw, _ = self.sock.recvfrom(1024)
@@ -305,9 +351,11 @@ class ControlReceiver:
                 command = json.loads(raw.decode("utf-8"))
                 if isinstance(command.get("scene"), str):
                     scene = command["scene"]
+                if isinstance(command.get("lamp"), int):
+                    lamp = int(clamp(command["lamp"], 0, 100))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 pass
-        return scene
+        return scene, lamp
 
     def close(self):
         self.sock.close()
@@ -324,6 +372,34 @@ class History:
         self.gpu_temp = deque(maxlen=length)
         self.rx_peak = 0.2
         self.tx_peak = 0.2
+        self.display = {}
+        self.display_at = time.monotonic()
+
+    def smooth(self, metrics):
+        now = time.monotonic()
+        dt = min(max(now - self.display_at, 0.0), 0.25)
+        self.display_at = now
+        smoothed = dict(metrics)
+        settling = {
+            "cpu": 0.55,
+            "mem": 1.4,
+            "cpu_temp": 2.0,
+            "rx": 0.9,
+            "tx": 0.9,
+            "gpu_util": 0.55,
+            "gpu_temp": 2.0,
+            "gpu_mem": 1.4,
+        }
+        for key, seconds in settling.items():
+            target = metrics.get(key)
+            if not isinstance(target, (int, float)):
+                continue
+            current = self.display.get(key, float(target))
+            alpha = 1.0 - math.exp(-dt / seconds)
+            value = current + (float(target) - current) * alpha
+            self.display[key] = value
+            smoothed[key] = value
+        return smoothed
 
     def push(self, m):
         self.cpu.append(float(m.get("cpu") or 0))
@@ -462,6 +538,68 @@ def gauge_legend(draw, left, right):
     draw.line((4, 53, 252, 53), fill=18)
     draw.text((4, 55), f"L {left}", font=F_TINY, fill=130)
     right_text(draw, 252, 55, f"{right} R", F_TINY, 130)
+
+
+def notification_text(notice):
+    title = str(notice.get("title") or "NOTICE").upper()
+    message = str(notice.get("message") or "")
+    return f"{title}: {message}".strip(": ")
+
+
+def notification_duration(notice):
+    text = notification_text(notice)
+    overflow = max(0, display_font(text, F_TINY).getbbox(text)[2] - 235)
+    return max(4.0, 1.5 + overflow / 32.0)
+
+
+def draw_notification(im, notice, elapsed):
+    duration = notification_duration(notice)
+    height = 12
+    if elapsed < 0.25:
+        y = 64 - int(height * elapsed / 0.25)
+    elif elapsed > duration - 0.3:
+        y = 52 + int(height * min((elapsed - (duration - 0.3)) / 0.3, 1.0))
+    else:
+        y = 52
+    if y >= HEIGHT:
+        return
+
+    d = make_draw(im)
+    text = notification_text(notice)
+    d.rectangle((0, y, 255, 63), fill=0)
+    d.line((4, y, 252, y), fill=85)
+    icon_fill = 255 if int(elapsed * 4) % 2 == 0 else 95
+    if notice.get("kind") == "music":
+        d.line((10, y + 3, 10, y + 8), fill=icon_fill)
+        d.line((10, y + 3, 13, y + 3), fill=icon_fill)
+        d.rectangle((7, y + 8, 10, y + 10), fill=icon_fill)
+    else:
+        d.polygon(((9, y + 3), (13, y + 7), (9, y + 11), (5, y + 7)), outline=icon_fill)
+        d.point((9, y + 7), fill=icon_fill)
+    text_image = Image.new("L", (235, 9))
+    text_draw = make_draw(text_image)
+    text_font = display_font(text, F_TINY)
+    text_width = text_draw.textbbox((0, 0), text, font=text_font)[2]
+    if text_width > 235:
+        offset = min(int(max(elapsed - 0.5, 0.0) * 32), text_width - 235)
+        text_draw.text((-offset, 0), text, font=text_font, fill=180)
+    else:
+        text_draw.text((0, 0), text, font=text_font, fill=180)
+    im.paste(text_image, (17, y + 3))
+
+
+def draw_wifi_recovery(t):
+    im = canvas()
+    d = make_draw(im)
+    ambient_header(d, "WIFI RECOVERY", "PANEL LINK")
+    center_text(d, 22, "VELOCITY WI-FI", F_MED_B, 190)
+    center_text(d, 36, "RECONNECTING", F_SMALL_B, 145)
+    phase = int(t * 8) % 8
+    for index in range(8):
+        x = 100 + index * 8
+        fill = 235 if index == phase else 45
+        d.rectangle((x, 48, x + 4, 50), fill=fill)
+    return im
 
 
 def graph_line(draw, values, x, y, w, h, max_value=100.0, fill=220, min_value=0.0):
@@ -721,6 +859,113 @@ def draw_scope(m, h, t):
     return im, left, right
 
 
+def draw_audio(m, h, t):
+    global AUDIO_RELEASED_AT, AUDIO_WAS_PAUSED, FROZEN_AUDIO_BANDS
+    im = canvas()
+    d = make_draw(im)
+    left = clamp(float(m.get("audio_left") or 0))
+    right = clamp(float(m.get("audio_right") or 0))
+    bass = clamp(float(m.get("audio_bass") or 0))
+    overall = clamp(float(m.get("audio_overall") or 0))
+    audio_state = str(m.get("audio_state") or "standby")
+    paused = audio_state == "paused"
+    now = time.monotonic()
+    if paused:
+        AUDIO_WAS_PAUSED = True
+        release = 0.0
+    elif AUDIO_WAS_PAUSED:
+        AUDIO_WAS_PAUSED = False
+        AUDIO_RELEASED_AT = now
+        release = 0.0
+    else:
+        release = min(max((now - AUDIO_RELEASED_AT) / 0.45, 0.0), 1.0) if AUDIO_RELEASED_AT else 1.0
+    frozen_visual = paused or release < 1.0
+    idle = audio_state == "standby"
+    header = "AUDIO PAUSED" if frozen_visual else "AUDIO STANDBY" if idle else "AUDIO SPECTRUM"
+    ambient_header(d, header, "")
+    artist = str(m.get("track_artist") or "").strip()
+    title = str(m.get("track_title") or "").strip()
+    track = " - ".join(part for part in (artist, title) if part)
+    if track:
+        track_width = 164
+        track_image = Image.new("L", (track_width, 9))
+        track_draw = make_draw(track_image)
+        track_font = display_font(track, F_TINY)
+        text_width = track_draw.textbbox((0, 0), track, font=track_font)[2]
+        offset = int(t * 16) % (text_width + 20) if text_width > track_width else 0
+        x = -offset if text_width > track_width else track_width - text_width
+        track_draw.text((x, 0), track, font=track_font, fill=110)
+        if text_width > track_width:
+            track_draw.text((text_width + 20 - offset, 0), track, font=track_font, fill=110)
+        im.paste(track_image, (88, 1))
+
+    live_bands = list(m.get("audio_bands") or [])[:32]
+    live_bands += [0.0] * (32 - len(live_bands))
+    if not paused:
+        FROZEN_AUDIO_BANDS = live_bands[:]
+    if paused:
+        bands = FROZEN_AUDIO_BANDS
+    elif release < 1.0:
+        bands = [old * (1.0 - release) + live * release for old, live in zip(FROZEN_AUDIO_BANDS, live_bands)]
+    else:
+        bands = live_bands
+    if idle:
+        bands = [0.0] * 32
+    left = 24
+    right = 232
+    top = 21
+    bottom = 50
+
+    # A restrained VFD grid keeps the spectrum graphic grounded without faking depth.
+    for x in range(left, right + 1, 13):
+        d.line((x, top, x, bottom), fill=18 if idle else int(10 + 4 * (1.0 - release)))
+    for y in range(top, bottom + 1, 6):
+        d.line((left, y, right, y), fill=24 if idle else int(14 + 6 * (1.0 - release)))
+    if idle:
+        mid_y = (top + bottom) / 2.0
+        node_xs = list(range(left + 1, right, 13)) + [right - 1]
+        for index, x in enumerate(node_xs):
+            phase = index * 0.9
+            speed = 1.3 + index * 0.11
+            y = int(mid_y + math.sin(t * speed + phase) * 12)
+            d.rectangle((x, y - 1, x + 1, y + 1), fill=145)
+
+    for index, value in enumerate(bands):
+        segments = int(round(10 * clamp(float(value)) / 100.0))
+        # Put bass in the center, then fan higher frequencies outward.
+        slot = 15 - index // 2 if index % 2 == 0 else 16 + index // 2
+        x0 = int(left + slot * (right - left) / 32.0 + 1)
+        x1 = x0 + 4
+        for segment in range(segments):
+            y1 = bottom - segment * 3
+            y0 = y1 - 1
+            fill = int(125 - 77 * (1.0 - release))
+            if segment == segments - 1:
+                fill = int(245 - 150 * (1.0 - release))
+            elif segment == segments - 2:
+                fill = int(180 - 112 * (1.0 - release))
+            d.rectangle((x0, y0, x1, y1), fill=fill)
+
+    position = max(0.0, float(m.get("track_position") or 0.0))
+    duration = max(0.0, float(m.get("track_duration") or 0.0))
+    progress = min(position / duration, 1.0) if duration else 0.0
+    d.line((4, 53, 252, 53), fill=18)
+    if paused:
+        d.line((4, 54, 252, 54), fill=28)
+        d.line((4, 54, 4 + int(248 * progress), 54), fill=75)
+        d.text((4, 55), "PAUSED", font=F_TINY, fill=110)
+        right_text(d, 252, 55, f"{int(position) // 60}:{int(position) % 60:02d}", F_TINY, 110)
+    elif idle:
+        d.text((4, 55), "NO SIGNAL", font=F_TINY, fill=85)
+        right_text(d, 252, 55, "WAITING", F_TINY, 85)
+    else:
+        d.line((4, 54, 252, 54), fill=28)
+        d.line((4, 54, 4 + int(248 * progress), 54), fill=135)
+        d.text((4, 55), f"{int(position) // 60}:{int(position) % 60:02d}", font=F_TINY, fill=110)
+        right_text(d, 252, 55, f"{int(duration) // 60}:{int(duration) % 60:02d}", F_TINY, 110)
+    return im, bass, overall
+
+
 CUBE_VERTICES = [
     (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
     (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
@@ -730,6 +975,76 @@ CUBE_EDGES = [
     (4, 5), (5, 6), (6, 7), (7, 4),
     (0, 4), (1, 5), (2, 6), (3, 7),
 ]
+
+
+def load_glb_wireframe(path):
+    try:
+        with open(path, "rb") as source:
+            data = source.read()
+        magic, version, _ = struct.unpack_from("<III", data, 0)
+        if magic != 0x46546C67 or version != 2:
+            raise ValueError("not a glTF 2 binary")
+        offset = 12
+        document = binary = None
+        while offset < len(data):
+            length, kind = struct.unpack_from("<II", data, offset)
+            chunk = data[offset + 8:offset + 8 + length]
+            if kind == 0x4E4F534A:
+                document = json.loads(chunk)
+            elif kind == 0x004E4942:
+                binary = chunk
+            offset += 8 + length
+        primitive = document["meshes"][0]["primitives"][0]
+
+        def accessor_values(index):
+            accessor = document["accessors"][index]
+            view = document["bufferViews"][accessor["bufferView"]]
+            components = {"SCALAR": 1, "VEC3": 3}[accessor["type"]]
+            formats = {5121: "B", 5123: "H", 5125: "I", 5126: "f"}
+            fmt = formats[accessor["componentType"]]
+            size = struct.calcsize(fmt) * components
+            stride = view.get("byteStride", size)
+            start = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+            return [
+                struct.unpack_from("<" + fmt * components, binary, start + item * stride)
+                for item in range(accessor["count"])
+            ]
+
+        vertices = accessor_values(primitive["attributes"]["POSITION"])
+        indices = [row[0] for row in accessor_values(primitive["indices"])]
+        matrix = next((node.get("matrix") for node in document["nodes"] if node.get("mesh") == 0), None)
+        if matrix:
+            vertices = [
+                (
+                    matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+                    matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+                    matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14],
+                )
+                for x, y, z in vertices
+            ]
+        center = tuple(sum(point[axis] for point in vertices) / len(vertices) for axis in range(3))
+        radius = max(max(abs(point[axis] - center[axis]) for point in vertices) for axis in range(3))
+        vertices = [tuple((point[axis] - center[axis]) / radius for axis in range(3)) for point in vertices]
+
+        edges = []
+        step = max(1, (len(indices) // 3) // 180)
+        for index in range(0, len(indices) - 2, step * 3):
+            edges.append((indices[index], indices[index + 1]))
+        return vertices, edges
+    except (OSError, KeyError, TypeError, ValueError, struct.error, json.JSONDecodeError):
+        return CUBE_VERTICES, CUBE_EDGES
+
+
+def load_wireframe_asset(path):
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            model = json.load(source)
+        return [tuple(point) for point in model["vertices"]], [tuple(edge) for edge in model["edges"]]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return CUBE_VERTICES, CUBE_EDGES
+
+
+MODEL_VERTICES, MODEL_EDGES = load_wireframe_asset(NISSAN_WIREFRAME)
 
 
 def rotate_point(p, ax, ay, az):
@@ -765,7 +1080,6 @@ def draw_wireframe(m, h, t):
         brightness = int(clamp(250 - (zavg - 3.0) * 55, 55, 235))
         d.line((*projected[a], *projected[b]), fill=brightness)
 
-    # moving floor marker
     d.line((cx - 14, 49, cx + 14, 49), fill=20)
     d.line((cx, 46, cx, 51), fill=20)
     gauge_legend(d, "YAW", "ROLL")
@@ -881,6 +1195,7 @@ SCENES = [
     ("wireframe", 7.0, draw_wireframe),
     ("gpu", 8.0, draw_gpu),
     ("scope", 7.0, draw_scope),
+    ("audio", 7.0, draw_audio),
     ("clock", 7.0, draw_clock),
     ("life", 7.0, draw_life),
     ("hex", 7.0, draw_hex),
@@ -891,6 +1206,8 @@ SCENES = [
 def scene_available(name, m):
     if name == "gpu":
         return m.get("gpu_util") is not None
+    if name == "audio":
+        return "audio_left" in m and "audio_right" in m
     return True
 
 
@@ -930,7 +1247,7 @@ def boot_sequence(oled, gauges):
     time.sleep(0.55)
 
 
-def scan_wipe(oled, old_im, new_im, frames=TRANSITION_FRAMES):
+def scan_wipe(oled, old_im, new_im, notice=None, notice_elapsed=0.0, frames=TRANSITION_FRAMES):
     """Fast hardware-paced scene wipe with a bright scan edge.
 
     V1 rendered at only 4 FPS and also slept after every wipe frame. V2 uses a
@@ -947,6 +1264,8 @@ def scan_wipe(oled, old_im, new_im, frames=TRANSITION_FRAMES):
             d.line((x, 0, x, HEIGHT - 1), fill=240)
             if x > 1:
                 d.line((x - 1, 0, x - 1, HEIGHT - 1), fill=70)
+        if notice:
+            draw_notification(frame, notice, notice_elapsed + i * target_dt)
         oled.send(frame)
         elapsed = time.monotonic() - started
         time.sleep(max(0.0, target_dt - elapsed))
@@ -979,7 +1298,8 @@ def main():
         boot_sequence(oled, gauges)
 
         m = telemetry.poll()
-        history.push(m)
+        display_m = history.smooth(m)
+        history.push(display_m)
         scene_index = 0
         while not scene_available(SCENES[scene_index][0], m):
             scene_index = (scene_index + 1) % len(SCENES)
@@ -987,13 +1307,40 @@ def main():
         scene_started = time.monotonic()
         last_image = canvas()
         manual_scene = None
+        notice_id = None
+        notice_started = 0.0
+        notice = None
+        wifi_recovery_until = 0.0
 
         while running:
             loop_start = time.monotonic()
             m = telemetry.poll()
-            history.push(m)
+            display_m = history.smooth(m)
+            history.push(display_m)
+            incoming_notice = m.get("notification")
+            if isinstance(incoming_notice, dict) and incoming_notice.get("id") != notice_id:
+                notice_id = incoming_notice.get("id")
+                notice_started = loop_start
+                notice = incoming_notice
 
-            requested_scene = controls.poll()
+            if gauges.poll_command() == "WIFI":
+                wifi_recovery_until = loop_start + 12.0
+                subprocess.Popen(
+                    ["sudo", "-n", "systemctl", "start", "panel-wifi-recover.service"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            if loop_start < wifi_recovery_until:
+                image = draw_wifi_recovery(loop_start)
+                oled.send(image)
+                last_image = image
+                elapsed = time.monotonic() - loop_start
+                time.sleep(max(0.0, FRAME_INTERVAL - elapsed))
+                continue
+
+            requested_scene, lamp = controls.poll()
+            if lamp is not None:
+                gauges.set_lamp(lamp)
             if requested_scene == "auto":
                 manual_scene = None
             elif requested_scene:
@@ -1002,9 +1349,12 @@ def main():
                         manual_scene = candidate
                         scene_index = index
                         scene_started = loop_start
-                        next_image, gl, gr = renderer(m, history, 0.0)
+                        next_image, gl, gr = renderer(display_m, history, 0.0)
+                        active_notice = notice if notice and loop_start - notice_started < notification_duration(notice) else None
+                        if candidate == "audio" and active_notice and active_notice.get("kind") == "music":
+                            active_notice = None
                         gauges.send(gl, gr)
-                        scan_wipe(oled, last_image, next_image)
+                        scan_wipe(oled, last_image, next_image, active_notice, loop_start - notice_started)
                         last_image = next_image
                         break
                 continue
@@ -1026,13 +1376,19 @@ def main():
                 scene_index = next_index
                 scene_started = time.monotonic()
                 name, duration, renderer = SCENES[scene_index]
-                next_image, gl, gr = renderer(m, history, 0.0)
+                next_image, gl, gr = renderer(display_m, history, 0.0)
+                active_notice = notice if notice and loop_start - notice_started < notification_duration(notice) else None
+                if name == "audio" and active_notice and active_notice.get("kind") == "music":
+                    active_notice = None
                 gauges.send(gl, gr)
-                scan_wipe(oled, last_image, next_image)
+                scan_wipe(oled, last_image, next_image, active_notice, loop_start - notice_started)
                 last_image = next_image
                 continue
 
-            image, gl, gr = renderer(m, history, scene_elapsed)
+            image, gl, gr = renderer(display_m, history, scene_elapsed)
+            if notice and loop_start - notice_started < notification_duration(notice):
+                if name != "audio" or notice.get("kind") != "music":
+                    draw_notification(image, notice, loop_start - notice_started)
             gauges.send(gl, gr)
             oled.send(image)
             last_image = image
